@@ -21,25 +21,114 @@ app.add_middleware(
 PRODUCTS = []
 DATA_URL = os.getenv("DATA_URL", "https://pub-b30a404e74844ba9afc36fbe8d311ec8.r2.dev/dropkiller_COMPLETO.zip")
 
+def deduplicate_products(productos: list) -> list:
+    """
+    Elimina productos duplicados por ID.
+    Mantiene el primer producto encontrado para cada ID.
+    Retorna lista de productos únicos.
+    """
+    productos_unicos = {}
+    duplicados_count = 0
+
+    for p in productos:
+        pid = p.get('id')
+        if pid:
+            if pid not in productos_unicos:
+                productos_unicos[pid] = p
+            else:
+                duplicados_count += 1
+        else:
+            # Productos sin ID se mantienen (no deberían existir, pero por si acaso)
+            productos_unicos[f"_no_id_{len(productos_unicos)}"] = p
+
+    print(f"[DEDUP] Duplicados eliminados: {duplicados_count}")
+    print(f"[DEDUP] Productos únicos: {len(productos_unicos)}")
+
+    return list(productos_unicos.values())
+
+
+def analyze_products(productos: list) -> dict:
+    """
+    Analiza los productos para generar estadísticas de calidad de datos.
+    """
+    sin_imagen = 0
+    sin_precio = 0
+    sin_ventas = 0
+    paises = set()
+
+    for p in productos:
+        # Verificar si tiene imagen
+        multimedia = p.get('multimedia', [])
+        if not multimedia or not multimedia[0].get('url'):
+            sin_imagen += 1
+
+        # Verificar precio
+        if not p.get('salePrice') or p.get('salePrice', 0) <= 0:
+            sin_precio += 1
+
+        # Verificar ventas
+        if not p.get('soldUnitsLast30Days') or p.get('soldUnitsLast30Days', 0) == 0:
+            sin_ventas += 1
+
+        # Buscar campo de país (puede estar en diferentes lugares)
+        country = p.get('country') or p.get('pais') or p.get('countryCode')
+        provider = p.get('provider', {})
+        if provider:
+            country = country or provider.get('country') or provider.get('countryCode')
+        if country:
+            paises.add(country)
+
+    stats = {
+        "total": len(productos),
+        "sin_imagen": sin_imagen,
+        "sin_precio": sin_precio,
+        "sin_ventas_30d": sin_ventas,
+        "paises_encontrados": list(paises) if paises else ["No hay campo de país - asumido CO"]
+    }
+
+    print(f"[ANÁLISIS] Total productos: {stats['total']}")
+    print(f"[ANÁLISIS] Sin imagen: {stats['sin_imagen']} ({100*sin_imagen/len(productos):.1f}%)")
+    print(f"[ANÁLISIS] Sin precio: {stats['sin_precio']}")
+    print(f"[ANÁLISIS] Sin ventas 30d: {stats['sin_ventas_30d']}")
+    print(f"[ANÁLISIS] Países: {stats['paises_encontrados']}")
+
+    return stats
+
+
+# Variable global para estadísticas
+DATA_STATS = {}
+
 @app.on_event("startup")
 async def load_data():
-    global PRODUCTS
+    global PRODUCTS, DATA_STATS
     print(f"Descargando datos desde {DATA_URL}...")
     async with httpx.AsyncClient(timeout=300) as client:
         response = await client.get(DATA_URL)
         print(f"Descargado: {len(response.content) / 1024 / 1024:.1f} MB")
-        
+
         with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
             for name in zf.namelist():
                 if name.endswith('.json'):
                     with zf.open(name) as f:
-                        PRODUCTS = json.load(f)
-                        print(f"Cargados {len(PRODUCTS)} productos")
+                        productos_raw = json.load(f)
+                        print(f"Productos en JSON (con duplicados): {len(productos_raw)}")
+
+                        # Eliminar duplicados
+                        PRODUCTS = deduplicate_products(productos_raw)
+
+                        # Analizar calidad de datos
+                        DATA_STATS = analyze_products(PRODUCTS)
+
+                        print(f"Productos finales cargados: {len(PRODUCTS)}")
                         break
 
 @app.get("/")
 def root():
-    return {"status": "ok", "productos": len(PRODUCTS)}
+    return {
+        "status": "ok",
+        "productos": len(PRODUCTS),
+        "data_stats": DATA_STATS
+    }
 
 @app.get("/api/productos")
 def buscar_productos(
@@ -49,12 +138,19 @@ def buscar_productos(
     min_precio: Optional[float] = Query(None, description="Precio mínimo"),
     max_precio: Optional[float] = Query(None, description="Precio máximo"),
     categoria: Optional[str] = Query(None, description="Filtrar por categoría"),
+    con_imagen: Optional[bool] = Query(None, description="Filtrar solo productos con imagen (True) o sin imagen (False)"),
     limit: int = Query(50, le=200, description="Límite de resultados"),
     offset: int = Query(0, description="Offset para paginación"),
     sort_by: str = Query("ventas30d", description="Ordenar por: ventas30d, ventasTotal, precio, nombre"),
     sort_order: str = Query("desc", description="asc o desc")
 ):
     results = PRODUCTS.copy()
+
+    # Filtrar por imagen
+    if con_imagen is True:
+        results = [p for p in results if p.get('multimedia') and len(p.get('multimedia', [])) > 0 and p.get('multimedia', [{}])[0].get('url')]
+    elif con_imagen is False:
+        results = [p for p in results if not p.get('multimedia') or len(p.get('multimedia', [])) == 0 or not p.get('multimedia', [{}])[0].get('url')]
     
     # Filtrar por búsqueda
     if q:
@@ -186,5 +282,26 @@ def listar_categorias():
         cat = p.get('baseCategory', {}).get('name') if p.get('baseCategory') else None
         if cat:
             categorias[cat] = categorias.get(cat, 0) + 1
-    
+
     return sorted([{"name": k, "count": v} for k, v in categorias.items()], key=lambda x: x['count'], reverse=True)
+
+
+@app.get("/api/data-quality")
+def data_quality():
+    """Estadísticas de calidad de datos después de la deduplicación"""
+    return {
+        "stats": DATA_STATS,
+        "mensaje": "Los datos son de Dropi Colombia. No hay campo explícito de país en los datos originales."
+    }
+
+
+@app.get("/api/debug/sample")
+def debug_sample():
+    """Muestra un producto de ejemplo con todos sus campos para debug"""
+    if PRODUCTS:
+        sample = PRODUCTS[0]
+        return {
+            "campos_disponibles": list(sample.keys()),
+            "producto_ejemplo": sample
+        }
+    return {"error": "No hay productos cargados"}
